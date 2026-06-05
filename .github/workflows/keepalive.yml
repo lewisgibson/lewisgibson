@@ -1,0 +1,36 @@
+name: Keepalive
+
+# Prevents the scheduled Metrics workflow from being auto-disabled after 60 days
+# of repository inactivity by committing a small periodic update.
+
+on:
+    schedule:
+        - cron: '41 6 * * 1'
+    workflow_dispatch: {}
+
+concurrency:
+    group: keepalive
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    ping:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Repository
+              uses: actions/checkout@v4
+              with:
+                  ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+                  fetch-depth: 1
+
+            - name: Configure Git Identity
+              run: |
+                  git config user.name 'Lewis Gibson'
+                  git config user.email '12851394+lewisgibson@users.noreply.github.com'
+
+            - name: Commit
+              run: |
+                  git commit --allow-empty -m 'chore: keepalive'
+                  git push origin HEAD:main
