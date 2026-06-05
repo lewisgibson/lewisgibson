@@ -23,52 +23,97 @@ jobs:
                   ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
                   fetch-depth: 1
 
-            # Run the metrics image directly (not via the composite action) so a
-            # git insteadOf rewrite can be injected — the action's own indepth
-            # clone is unauthenticated and silently skips private repositories.
-            # The token comes from a secret (masked in logs); no repository names
-            # appear anywhere, and debug is off so per-repo clone lines aren't logged.
-            - name: Generate metrics
+            # Run the metrics image directly so additional container configuration
+            # can be supplied. The token is read from a secret (masked in logs).
+            - name: Generate Metrics
               env:
                   METRICS_TOKEN: ${{ secrets.METRICS_TOKEN }}
               run: |
                   set -euo pipefail
                   mkdir -p renders && chmod 777 renders
-                  docker run --rm \
-                    -e INPUT_TOKEN="$METRICS_TOKEN" \
-                    -e INPUT_USER=lewisgibson \
-                    -e INPUT_TEMPLATE=classic \
-                    -e INPUT_BASE_INDEPTH=yes \
-                    -e INPUT_PLUGIN_TRAFFIC=yes \
-                    -e INPUT_PLUGIN_LANGUAGES=yes \
-                    -e INPUT_PLUGIN_LANGUAGES_INDEPTH=yes \
-                    -e "INPUT_PLUGIN_LANGUAGES_IGNORED=html, css" \
-                    -e "INPUT_PLUGIN_LANGUAGES_DETAILS=lines, percentage" \
-                    -e INPUT_PLUGIN_LANGUAGES_SECTIONS=most-used \
-                    -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT=60 \
-                    -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT_REPOSITORIES=15 \
-                    -e "INPUT_COMMITS_AUTHORING=lewisgibson, 12851394+lewisgibson@users.noreply.github.com" \
-                    -e GIT_CONFIG_COUNT=1 \
-                    -e "GIT_CONFIG_KEY_0=url.https://${METRICS_TOKEN}@github.com/.insteadOf" \
-                    -e GIT_CONFIG_VALUE_0=https://github.com/ \
-                    -e INPUT_OUTPUT_ACTION=none \
-                    -e INPUT_FILENAME=github-metrics.svg \
-                    -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-                    -e GITHUB_TOKEN="$METRICS_TOKEN" \
-                    -v "$PWD/renders:/renders" \
-                    ghcr.io/lowlighter/metrics:v3.34
+
+                  pull_image() {
+                      for attempt in 1 2 3; do
+                          docker pull --quiet ghcr.io/lowlighter/metrics:v3.34 && return 0
+                          echo "Image pull attempt ${attempt} failed, retrying..."
+                          sleep $((attempt * 10))
+                      done
+                      return 1
+                  }
+
+                  run_metrics() {
+                      docker run --rm \
+                        -e INPUT_TOKEN="$METRICS_TOKEN" \
+                        -e INPUT_USER=lewisgibson \
+                        -e INPUT_TEMPLATE=classic \
+                        -e INPUT_BASE_INDEPTH=yes \
+                        -e INPUT_PLUGIN_TRAFFIC=yes \
+                        -e INPUT_PLUGIN_LANGUAGES=yes \
+                        -e INPUT_PLUGIN_LANGUAGES_INDEPTH=yes \
+                        -e "INPUT_PLUGIN_LANGUAGES_IGNORED=html, css" \
+                        -e "INPUT_PLUGIN_LANGUAGES_DETAILS=lines, percentage" \
+                        -e INPUT_PLUGIN_LANGUAGES_SECTIONS=most-used \
+                        -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT=60 \
+                        -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT_REPOSITORIES=15 \
+                        -e "INPUT_COMMITS_AUTHORING=lewisgibson, 12851394+lewisgibson@users.noreply.github.com" \
+                        -e GIT_CONFIG_COUNT=1 \
+                        -e "GIT_CONFIG_KEY_0=url.https://${METRICS_TOKEN}@github.com/.insteadOf" \
+                        -e GIT_CONFIG_VALUE_0=https://github.com/ \
+                        -e INPUT_OUTPUT_ACTION=none \
+                        -e INPUT_FILENAME=github-metrics.svg \
+                        -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+                        -e GITHUB_TOKEN="$METRICS_TOKEN" \
+                        -v "$PWD/renders:/renders" \
+                        ghcr.io/lowlighter/metrics:v3.34
+                  }
+
+                  pull_image || echo "Could not pre-pull image; docker run will pull on demand."
+
+                  ok=
+                  for attempt in 1 2 3; do
+                      if run_metrics; then ok=1; break; fi
+                      echo "Metrics generation attempt ${attempt} failed, retrying..."
+                      sleep $((attempt * 20))
+                  done
+                  [ -n "$ok" ] || { echo "Metrics generation failed after retries." >&2; exit 1; }
+
+                  # The render is only useful if it actually produced an SVG.
                   test -s renders/github-metrics.svg
                   cp renders/github-metrics.svg github-metrics.svg
 
-            - name: Commit and push
+            - name: Commit And Push
               run: |
                   set -euo pipefail
                   git config user.name 'Lewis Gibson'
                   git config user.email '12851394+lewisgibson@users.noreply.github.com'
+
                   if git diff --quiet -- github-metrics.svg; then
                       echo 'No change.'
-                  else
-                      git add github-metrics.svg
-                      git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
-                      git push origin HEAD:main
+                      exit 0
                   fi
+
+                  git add github-metrics.svg
+                  git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
+
+                  # Resilient push: on a non-fast-forward, rebase onto the latest
+                  # remote tip and retry; if the rebase ever conflicts, reset to the
+                  # remote and re-apply our freshly rendered SVG.
+                  for attempt in 1 2 3 4 5; do
+                      if git push origin HEAD:main; then
+                          echo "Pushed on attempt ${attempt}."
+                          exit 0
+                      fi
+                      echo "Push attempt ${attempt} failed; syncing with remote and retrying."
+                      git fetch --depth=1 origin main
+                      if ! git rebase origin/main; then
+                          git rebase --abort || true
+                          git reset --hard origin/main
+                          cp renders/github-metrics.svg github-metrics.svg
+                          git add github-metrics.svg
+                          git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
+                      fi
+                      sleep $((attempt * 3))
+                  done
+
+                  echo 'Push failed after retries.' >&2
+                  exit 1
