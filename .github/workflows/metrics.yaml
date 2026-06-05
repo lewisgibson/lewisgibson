@@ -6,24 +6,69 @@ on:
     workflow_dispatch:
 
 permissions:
-    contents: write
+    contents: read
+
+concurrency:
+    group: metrics
+    cancel-in-progress: false
 
 jobs:
     metrics:
         runs-on: ubuntu-latest
+        timeout-minutes: 90
         steps:
-            - name: Generate metrics
-              uses: lowlighter/metrics@latest
+            - name: Checkout Repository
+              uses: actions/checkout@v4
               with:
-                  token: ${{ secrets.METRICS_TOKEN }}
-                  use_prebuilt_image: no
-                  commits_authoring: lewisgibson, 12851394+lewisgibson@users.noreply.github.com
-                  base_indepth: yes
-                  plugin_traffic: yes
-                  plugin_languages: yes
-                  plugin_languages_indepth: yes
-                  plugin_languages_ignored: html, css
-                  plugin_languages_details: lines, percentage
-                  plugin_languages_sections: most-used
-                  plugin_languages_analysis_timeout: 20
-                  plugin_languages_analysis_timeout_repositories: 15
+                  ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+                  fetch-depth: 1
+
+            # Run the metrics image directly (not via the composite action) so a
+            # git insteadOf rewrite can be injected — the action's own indepth
+            # clone is unauthenticated and silently skips private repositories.
+            # The token comes from a secret (masked in logs); no repository names
+            # appear anywhere, and debug is off so per-repo clone lines aren't logged.
+            - name: Generate metrics
+              env:
+                  METRICS_TOKEN: ${{ secrets.METRICS_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p renders && chmod 777 renders
+                  docker run --rm \
+                    -e INPUT_TOKEN="$METRICS_TOKEN" \
+                    -e INPUT_USER=lewisgibson \
+                    -e INPUT_TEMPLATE=classic \
+                    -e INPUT_BASE_INDEPTH=yes \
+                    -e INPUT_PLUGIN_TRAFFIC=yes \
+                    -e INPUT_PLUGIN_LANGUAGES=yes \
+                    -e INPUT_PLUGIN_LANGUAGES_INDEPTH=yes \
+                    -e "INPUT_PLUGIN_LANGUAGES_IGNORED=html, css" \
+                    -e "INPUT_PLUGIN_LANGUAGES_DETAILS=lines, percentage" \
+                    -e INPUT_PLUGIN_LANGUAGES_SECTIONS=most-used \
+                    -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT=60 \
+                    -e INPUT_PLUGIN_LANGUAGES_ANALYSIS_TIMEOUT_REPOSITORIES=15 \
+                    -e "INPUT_COMMITS_AUTHORING=lewisgibson, 12851394+lewisgibson@users.noreply.github.com" \
+                    -e GIT_CONFIG_COUNT=1 \
+                    -e "GIT_CONFIG_KEY_0=url.https://${METRICS_TOKEN}@github.com/.insteadOf" \
+                    -e GIT_CONFIG_VALUE_0=https://github.com/ \
+                    -e INPUT_OUTPUT_ACTION=none \
+                    -e INPUT_FILENAME=github-metrics.svg \
+                    -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+                    -e GITHUB_TOKEN="$METRICS_TOKEN" \
+                    -v "$PWD/renders:/renders" \
+                    ghcr.io/lowlighter/metrics:v3.34
+                  test -s renders/github-metrics.svg
+                  cp renders/github-metrics.svg github-metrics.svg
+
+            - name: Commit and push
+              run: |
+                  set -euo pipefail
+                  git config user.name 'Lewis Gibson'
+                  git config user.email '12851394+lewisgibson@users.noreply.github.com'
+                  if git diff --quiet -- github-metrics.svg; then
+                      echo 'No change.'
+                  else
+                      git add github-metrics.svg
+                      git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
+                      git push origin HEAD:main
+                  fi
