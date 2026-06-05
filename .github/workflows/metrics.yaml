@@ -16,6 +16,7 @@ jobs:
               uses: lowlighter/metrics@v3.34
               with:
                   token: ${{ secrets.METRICS_TOKEN }}
+                  commits_authoring: lewisgibson, 12851394+lewisgibson@users.noreply.github.com
                   base_indepth: yes
                   plugin_traffic: yes
                   plugin_languages: yes
@@ -23,3 +24,5 @@ jobs:
                   plugin_languages_ignored: html, css
                   plugin_languages_details: lines, percentage
                   plugin_languages_sections: most-used
+                  plugin_languages_analysis_timeout: 20
+                  plugin_languages_analysis_timeout_repositories: 15
