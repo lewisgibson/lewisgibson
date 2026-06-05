@@ -1,13 +1,31 @@
 name: Metrics
 
+# Renders the GitHub "metrics" card (stats + language breakdown) once a day and
+# commits the resulting SVG to this repository.
+#
+# Why this runs the image directly instead of `uses: lowlighter/metrics@...`:
+# the published action wraps the image in a composite that builds the container
+# environment from a fixed allow-list (INPUT_* plus GITHUB/ACTIONS/CI/TZ only),
+# so there is no supported way to pass the extra git configuration the language
+# analysis needs through it. Running the image ourselves gives full control of
+# the container environment. The API token is read from a repository secret and
+# is masked everywhere it could otherwise appear in logs.
+
 on:
     schedule:
+        # Daily at 00:00 UTC. GitHub may delay scheduled runs under load; the card
+        # is not time-sensitive, so that is fine.
         - cron: '0 0 * * *'
+
+    # Allow manual runs from the Actions tab.
     workflow_dispatch:
 
+# Least privilege: the SVG is pushed with the SSH deploy key configured by the
+# checkout step, so the workflow's own token needs read access only.
 permissions:
     contents: read
 
+# Never run two renders at once, and never cancel one while it is mid-push.
 concurrency:
     group: metrics
     cancel-in-progress: false
@@ -15,35 +33,55 @@ concurrency:
 jobs:
     metrics:
         runs-on: ubuntu-latest
+        # The deep language analysis can run for the better part of an hour; this
+        # generous ceiling is the hard backstop that stops a wedged run hanging.
         timeout-minutes: 90
         steps:
             - name: Checkout Repository
-              uses: actions/checkout@v4
+              uses: actions/checkout@v6.0.3
               with:
+                  # Deploy key: authenticates the `git push` of the rendered SVG.
                   ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
                   fetch-depth: 1
 
-            # Run the metrics image directly so additional container configuration
-            # can be supplied. The token is read from a secret (masked in logs).
             - name: Generate Metrics
               env:
+                  # Read once into the step environment so it is masked in logs and
+                  # is never interpolated straight onto a command line.
                   METRICS_TOKEN: ${{ secrets.METRICS_TOKEN }}
               run: |
                   set -euo pipefail
-                  mkdir -p renders && chmod 777 renders
 
+                  readonly IMAGE='ghcr.io/lowlighter/metrics:v3.34'
+
+                  # The container runs as root and writes the SVG into a bind mount;
+                  # the folder must be world-writable so root can write it and this
+                  # (non-root) job can read it back.
+                  mkdir -p renders
+                  chmod 777 renders
+
+                  # Pull with retries so a transient registry hiccup does not fail
+                  # the run. Non-fatal: if every attempt fails, `docker run` pulls
+                  # the image on demand anyway.
                   pull_image() {
+                      local attempt
                       for attempt in 1 2 3; do
-                          docker pull --quiet ghcr.io/lowlighter/metrics:v3.34 && return 0
-                          echo "Image pull attempt ${attempt} failed, retrying..."
+                          if docker pull --quiet "${IMAGE}"; then
+                              return 0
+                          fi
+                          echo "Image pull attempt ${attempt} failed; retrying in $((attempt * 10))s..."
                           sleep $((attempt * 10))
                       done
                       return 1
                   }
 
+                  # One render attempt. The git `insteadOf` rewrite makes every
+                  # https://github.com/ clone carry the token, so the indepth
+                  # language analysis can read private repositories (the image's own
+                  # clone is otherwise unauthenticated and silently skips them).
                   run_metrics() {
                       docker run --rm \
-                        -e INPUT_TOKEN="$METRICS_TOKEN" \
+                        -e INPUT_TOKEN="${METRICS_TOKEN}" \
                         -e INPUT_USER=lewisgibson \
                         -e INPUT_TEMPLATE=classic \
                         -e INPUT_BASE_INDEPTH=yes \
@@ -61,43 +99,59 @@ jobs:
                         -e GIT_CONFIG_VALUE_0=https://github.com/ \
                         -e INPUT_OUTPUT_ACTION=none \
                         -e INPUT_FILENAME=github-metrics.svg \
-                        -e GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-                        -e GITHUB_TOKEN="$METRICS_TOKEN" \
-                        -v "$PWD/renders:/renders" \
-                        ghcr.io/lowlighter/metrics:v3.34
+                        -e GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+                        -e GITHUB_TOKEN="${METRICS_TOKEN}" \
+                        -v "${PWD}/renders:/renders" \
+                        "${IMAGE}"
                   }
 
-                  pull_image || echo "Could not pre-pull image; docker run will pull on demand."
+                  pull_image || echo 'Pre-pull failed; the image will be pulled on demand.'
 
-                  ok=
+                  # Retry the render for transient failures (network/clone flakiness).
+                  # `set -e` is satisfied because the failing call sits in an `if`.
+                  rendered=
                   for attempt in 1 2 3; do
-                      if run_metrics; then ok=1; break; fi
-                      echo "Metrics generation attempt ${attempt} failed, retrying..."
+                      if run_metrics; then
+                          rendered=1
+                          break
+                      fi
+                      echo "Metrics generation attempt ${attempt} failed; retrying in $((attempt * 20))s..."
                       sleep $((attempt * 20))
                   done
-                  [ -n "$ok" ] || { echo "Metrics generation failed after retries." >&2; exit 1; }
+                  if [ -z "${rendered}" ]; then
+                      echo 'Metrics generation failed after all retries.' >&2
+                      exit 1
+                  fi
 
-                  # The render is only useful if it actually produced an SVG.
-                  test -s renders/github-metrics.svg
+                  # The image always writes /renders/<filename>; the run is only
+                  # useful if a non-empty SVG actually landed there.
+                  if [ ! -s renders/github-metrics.svg ]; then
+                      echo 'Render produced no SVG output.' >&2
+                      exit 1
+                  fi
                   cp renders/github-metrics.svg github-metrics.svg
 
             - name: Commit And Push
               run: |
                   set -euo pipefail
+
                   git config user.name 'Lewis Gibson'
                   git config user.email '12851394+lewisgibson@users.noreply.github.com'
 
+                  # Nothing to do if the card is byte-for-byte unchanged.
                   if git diff --quiet -- github-metrics.svg; then
-                      echo 'No change.'
+                      echo 'Card unchanged; nothing to commit.'
                       exit 0
                   fi
 
                   git add github-metrics.svg
                   git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
 
-                  # Resilient push: on a non-fast-forward, rebase onto the latest
-                  # remote tip and retry; if the rebase ever conflicts, reset to the
-                  # remote and re-apply our freshly rendered SVG.
+                  # Resilient push. The scheduled job is single-writer, but a manual
+                  # run could overlap, so on a non-fast-forward we sync and retry.
+                  # We only ever touch the SVG, so a rebase almost never conflicts;
+                  # if it somehow does, reset to the remote tip and re-apply our
+                  # freshly rendered SVG as one clean commit.
                   for attempt in 1 2 3 4 5; do
                       if git push origin HEAD:main; then
                           echo "Pushed on attempt ${attempt}."
@@ -110,10 +164,15 @@ jobs:
                           git reset --hard origin/main
                           cp renders/github-metrics.svg github-metrics.svg
                           git add github-metrics.svg
+                          # If the remote already holds this exact SVG, we are done.
+                          if git diff --cached --quiet; then
+                              echo 'Remote already up to date.'
+                              exit 0
+                          fi
                           git commit -m 'Update github-metrics.svg - [Skip GitHub Action]'
                       fi
                       sleep $((attempt * 3))
                   done
 
-                  echo 'Push failed after retries.' >&2
+                  echo 'Push failed after all retries.' >&2
                   exit 1
