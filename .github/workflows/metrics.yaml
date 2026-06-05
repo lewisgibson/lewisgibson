@@ -13,9 +13,10 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Generate metrics
-              uses: lowlighter/metrics@366f8b9dfe3a59656c67d5dcad9950f59c9bc96d
+              uses: lowlighter/metrics@latest
               with:
                   token: ${{ secrets.METRICS_TOKEN }}
+                  use_prebuilt_image: no
                   commits_authoring: lewisgibson, 12851394+lewisgibson@users.noreply.github.com
                   base_indepth: yes
                   plugin_traffic: yes
