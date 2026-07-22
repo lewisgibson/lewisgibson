@@ -107,24 +107,45 @@ jobs:
 
                   pull_image || echo 'Pre-pull failed; the image will be pulled on demand.'
 
-                  # Retry the render for transient failures (network/clone flakiness).
-                  # `set -e` is satisfied because the failing call sits in an `if`.
+                  # A zero-exit render is not proof of a good card. When the API token
+                  # is missing scopes (or GitHub has an auth hiccup), the image still
+                  # writes an SVG and still exits 0 -- plugin errors are "displayed in
+                  # the generated image", not treated as fatal -- but the card is a
+                  # useless skeleton: every stat reads `NaN`, the languages section is
+                  # empty, and a red "Insufficient token scopes" box sits where the
+                  # data should be. Committing that overwrites the last good card with a
+                  # blank one while the run still shows green, so nobody notices for
+                  # days. Guard against it by inspecting the SVG -- these markers appear
+                  # only in a degraded render, never in a healthy one, and each is
+                  # anchored (surrounding spaces / `<`,`>`,`"`) so it cannot collide
+                  # with the base64 image data embedded in the card.
+                  is_degraded() {
+                      grep -qaE 'Insufficient token scopes| NaN |class="field error"|No push activity found' "$1"
+                  }
+
+                  # Retry for transient failures (network/clone flakiness) AND for a
+                  # degraded render -- a fresh attempt usually comes back clean. `set -e`
+                  # is satisfied because the failing call sits in an `if`.
                   rendered=
                   for attempt in 1 2 3; do
-                      if run_metrics; then
+                      if run_metrics && ! is_degraded renders/github-metrics.svg; then
                           rendered=1
                           break
                       fi
-                      echo "Metrics generation attempt ${attempt} failed; retrying in $((attempt * 20))s..."
+                      echo "Metrics generation attempt ${attempt} produced no usable card (render failed or came back degraded); retrying in $((attempt * 20))s..."
                       sleep $((attempt * 20))
                   done
                   if [ -z "${rendered}" ]; then
-                      echo 'Metrics generation failed after all retries.' >&2
+                      # Deliberately do NOT commit. Leaving the previous good card in
+                      # place and failing the run (red X + a notification) is strictly
+                      # better than silently publishing a blank card -- this is the exact
+                      # failure that went unnoticed for four days in July 2026.
+                      echo 'Every render attempt was empty or degraded; leaving the existing card untouched.' >&2
                       exit 1
                   fi
 
-                  # The image always writes /renders/<filename>; the run is only
-                  # useful if a non-empty SVG actually landed there.
+                  # Belt and braces: the image always writes /renders/<filename>; the
+                  # run is only useful if a non-empty SVG actually landed there.
                   if [ ! -s renders/github-metrics.svg ]; then
                       echo 'Render produced no SVG output.' >&2
                       exit 1
